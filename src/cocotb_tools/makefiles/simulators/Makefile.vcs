@@ -4,13 +4,6 @@
 # Licensed under the Revised BSD License, see LICENSE for details.
 # SPDX-License-Identifier: BSD-3-Clause
 
-ifneq ($(VHDL_SOURCES),)
-
-$(COCOTB_RESULTS_FILE):
-	@echo "Skipping simulation as VHDL is not supported on simulator=$(SIM)"
-
-else
-
 CMD_BIN := vcs
 
 ifdef VCS_BIN_DIR
@@ -21,12 +14,13 @@ else
     VCS_BIN_DIR := $(shell dirname $(CMD))
 endif
 
-ifdef VERILOG_INCLUDE_DIRS
-    COMPILE_ARGS += $(addprefix +incdir+, $(VERILOG_INCLUDE_DIRS))
-endif
+COMPILE_ARGS ?=
+EXTRA_ARGS   ?=
+ELAB_ARGS    ?=
 
 ifeq ($(PYTHON_ARCH),64bit)
     COMPILE_ARGS += -full64
+    ELAB_ARGS    += -full64
 endif
 
 ifeq ($(GUI),1)
@@ -34,24 +28,102 @@ ifeq ($(GUI),1)
 endif
 
 # Avoid linker "undefined reference to" error
-COMPILE_ARGS += -LDFLAGS -Wl,--no-as-needed
+ELAB_ARGS += -LDFLAGS -Wl,--no-as-needed
 
 # Enables globally access for read, write, and callback capabilities.
-COMPILE_ARGS += +acc+3
+ELAB_ARGS += +acc+3
 
 # Enables globally debug capabilities.
-COMPILE_ARGS += -debug_access+all
+ELAB_ARGS += -debug_access+all
 
 # TODO:
 # investigate +vpi+1 option which reduces memory requirements
 
-# Compilation phase
-$(SIM_BUILD)/simv: $(VERILOG_SOURCES) $(CUSTOM_COMPILE_DEPS) | $(SIM_BUILD)
+# Compute SHA256 checksum of argument $1.
+sha256sum = $(strip $(shell printf '%s' "$1" | sha256sum | awk '{ print $$1 }'))
+
+# Generate Verilog and VHDL filelists with unique names based on the checksum of
+# the source files. This ensures that when the source files change, the filelist
+# name also changes, forcing a rebuild of the simulator executable.
+
+ELAB_DEPS = $(CUSTOM_SIM_DEPS)
+
+VERILOG_INCLUDE_DIRS  ?=
+VERILOG_LIBRARY_DIRS  ?=
+VERILOG_SOURCES       ?=
+CUSTOM_COMPILE_DEPS   ?=
+
+# Compile Verilog sources (if present)
+ifneq ($(VERILOG_SOURCES),)
+vlog_filelist_base = filelist_vlog
+SIM_VLOG_FILELIST  = $(SIM_BUILD)/$(vlog_filelist_base)-$(call sha256sum,$(VERILOG_SOURCES)).f
+
+#$(file >tmp.$(@F)) $(foreach f,$(VERILOG_SOURCES),$(file >>tmp.$(@F),$(abspath $(f))))
+$(SIM_VLOG_FILELIST): $(VERILOG_SOURCES) | $(SIM_BUILD)
+	rm -f $(SIM_BUILD)/$(vlog_filelist_base)*.f
+	@touch $@
+	@echo "-timescale=$(COCOTB_HDL_TIMEUNIT)/$(COCOTB_HDL_TIMEPRECISION)" >> $@; \
+	echo "-sverilog" >> $@; \
+	for f in $(foreach f,$(VERILOG_INCLUDE_DIRS),$(abspath $(f))); do \
+	  echo "+incdir+$$f" >> $@; \
+	done ; \
+	if [ ! -z "$(VERILOG_LIBRARY_DIRS)" ] ; then \
+	  echo "+libext+.sv+.v" >> $@; \
+	  for f in $(foreach f,$(VERILOG_LIBRARY_DIRS),$(abspath $(f))); do \
+	    echo "-y $$f" >> $@; \
+	  done ; \
+	fi ; \
+	for f in $(foreach f,$(VERILOG_INCLUDE_DIRS),$(abspath $(f))); do \
+	  echo "+incdir+$$f" >> $@; \
+	done ; \
+	for f in $(foreach f,$(VERILOG_SOURCES),$(abspath $(f))); do \
+	  echo "$$f" >> $@; \
+	done
+
+$(SIM_BUILD)/_vmake.vlogan: $(SIM_VLOG_FILELIST) $(CUSTOM_COMPILE_DEPS)
+	cd $(@D) && \
+	vlogan $(call deprecate,PLUSARGS,COCOTB_PLUSARGS) $(COMPILE_ARGS) $(EXTRA_ARGS) -l vlog.log -f $(<F)
+
+ELAB_DEPS += $(SIM_BUILD)/_vmake.vlogan
+endif
+
+VHDL_SOURCES ?=
+
+# Compile VHDL sources (if present)
+ifneq ($(VHDL_SOURCES),)
+vhdl_filelist_base = filelist_vhdl
+SIM_VHDL_FILELIST  = $(SIM_BUILD)/$(vhdl_filelist_base)-$(call sha256sum,$(VHDL_SOURCES)).f
+
+#$(file >tmp.$(@F)) $(foreach f,$(VHDL_SOURCES),$(file >>tmp.$(@F),$(abspath $(f))))
+$(SIM_VHDL_FILELIST): $(VHDL_SOURCES) | $(SIM_BUILD)
+	rm -f $(SIM_BUILD)/$(vhdl_filelist_base)*.f
+	@for f in $(foreach f,$(VHDL_SOURCES),$(abspath $(f))); do \
+	  echo "$$f" >> $@; \
+	done
+
+$(SIM_BUILD)/_vmake.vhdlan: $(SIM_VHDL_FILELIST) $(CUSTOM_COMPILE_DEPS)
+	cd $(@D) && \
+	vhdlan $(call deprecate,PLUSARGS,COCOTB_PLUSARGS) $(COMPILE_ARGS) $(EXTRA_ARGS) -l vhdl.log -f $(<F)
+
+ELAB_DEPS += $(SIM_BUILD)/_vmake.vhdlan
+endif
+
+# Load appropriate cocotb language programming interface library based on TOPLEVEL_LANG
+ifeq ($(TOPLEVEL_LANG),vhdl)
+    VCS_PI_LIBRARY = vhpi
+else ifeq ($(TOPLEVEL_LANG),verilog)
+    VCS_PI_LIBRARY = vpi
+else
+    $(error A valid value (verilog or vhdl) was not provided for TOPLEVEL_LANG)
+endif
+
+# Elaboration phase
+$(SIM_BUILD)/simv: $(ELAB_DEPS) | $(SIM_BUILD)
 	cd $(SIM_BUILD) && \
 	COCOTB_TOPLEVEL=$(call deprecate,TOPLEVEL,COCOTB_TOPLEVEL) \
-	$(CMD) -top $(COCOTB_TOPLEVEL) $(call deprecate,PLUSARGS,COCOTB_PLUSARGS) -sverilog \
+	$(CMD) -top $(COCOTB_TOPLEVEL) $(call deprecate,PLUSARGS,COCOTB_PLUSARGS) \
 	-timescale=$(COCOTB_HDL_TIMEUNIT)/$(COCOTB_HDL_TIMEPRECISION) \
-	$(EXTRA_ARGS) -load $(shell $(PYTHON_BIN) -m cocotb_tools.config --lib-name-path vpi vcs) $(COMPILE_ARGS) $(VERILOG_SOURCES)
+	$(EXTRA_ARGS) -load $(shell $(PYTHON_BIN) -m cocotb_tools.config --lib-name-path $(VCS_PI_LIBRARY) vcs) $(ELAB_ARGS)
 
 # Execution phase
 $(COCOTB_RESULTS_FILE): $(SIM_BUILD)/simv $(CUSTOM_SIM_DEPS)
@@ -61,5 +133,3 @@ $(COCOTB_RESULTS_FILE): $(SIM_BUILD)/simv $(CUSTOM_SIM_DEPS)
 	$(SIM_CMD_PREFIX) $(SIM_BUILD)/simv $(SIM_ARGS) $(EXTRA_ARGS) $(call deprecate,PLUSARGS,COCOTB_PLUSARGS) $(SIM_CMD_SUFFIX)
 
 	$(call check_results)
-
-endif
